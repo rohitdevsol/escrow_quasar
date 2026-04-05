@@ -1,7 +1,7 @@
 extern crate std;
 
-use escrow_quasar_client::MakeInstruction;
-use quasar_svm::{ Account, Instruction, Pubkey, QuasarSvm, token::{ Mint } };
+use escrow_quasar_client::{ MakeInstruction, RefundInstruction, TakeInstruction };
+use quasar_svm::{ Account, ExecutionResult, Instruction, Pubkey, QuasarSvm, token::Mint };
 use solana_address::Address;
 use solana_keypair::{ Keypair, Signer };
 use solana_program_option::COption;
@@ -10,11 +10,14 @@ use solana_program_pack::Pack;
 
 struct State {
     maker: Keypair,
+    taker: Keypair,
     mint_a: Pubkey,
     mint_b: Pubkey,
     escrow: Address,
     maker_ata_a: Address,
     maker_ata_b: Address,
+    taker_ata_b: Address,
+    taker_ata_a: Address,
     vault_ata_a: Address,
 }
 
@@ -32,6 +35,7 @@ fn setup() -> (QuasarSvm, State) {
     // return a resuable state from here
 
     let maker = Keypair::new();
+    let taker = Keypair::new();
     let mint_a = Pubkey::new_unique();
     let mint_b = Pubkey::new_unique();
 
@@ -43,6 +47,15 @@ fn setup() -> (QuasarSvm, State) {
     // maker - already funded account
     svm.set_account(Account {
         address: maker.pubkey(),
+        lamports: 20_000_000_000,
+        data: vec![],
+        owner: quasar_svm::system_program::ID,
+        executable: false,
+    });
+
+    // taker is also funfed account
+    svm.set_account(Account {
+        address: taker.pubkey(),
         lamports: 20_000_000_000,
         data: vec![],
         owner: quasar_svm::system_program::ID,
@@ -64,6 +77,16 @@ fn setup() -> (QuasarSvm, State) {
         &quasar_svm::SPL_ASSOCIATED_TOKEN_PROGRAM_ID
     );
 
+    let (taker_ata_a, _) = Pubkey::find_program_address(
+        &[taker.pubkey().as_ref(), quasar_svm::SPL_TOKEN_PROGRAM_ID.as_ref(), mint_a.as_ref()],
+        &quasar_svm::SPL_ASSOCIATED_TOKEN_PROGRAM_ID
+    );
+
+    let (taker_ata_b, _) = Pubkey::find_program_address(
+        &[taker.pubkey().as_ref(), quasar_svm::SPL_TOKEN_PROGRAM_ID.as_ref(), mint_b.as_ref()],
+        &quasar_svm::SPL_ASSOCIATED_TOKEN_PROGRAM_ID
+    );
+
     // maker ATA for mint_a - has tokens to deposit
     svm.set_account(
         quasar_svm::token::create_keyed_associated_token_account(
@@ -73,9 +96,23 @@ fn setup() -> (QuasarSvm, State) {
         )
     );
 
+    // taker ATA on mint b. to give out the tokens for exhanging
+    svm.set_account(
+        quasar_svm::token::create_keyed_associated_token_account(
+            &taker.pubkey(),
+            &mint_b,
+            50_000_000_000
+        )
+    );
+
     // maker ATA for mint_b - receives tokens, starts empty
     svm.set_account(
         quasar_svm::token::create_keyed_associated_token_account(&maker.pubkey(), &mint_b, 0)
+    );
+
+    // taker ATA for mint_a - receives tokens, starts empty
+    svm.set_account(
+        quasar_svm::token::create_keyed_associated_token_account(&taker.pubkey(), &mint_a, 0)
     );
 
     let (vault_ata_a, _) = Pubkey::find_program_address(
@@ -103,50 +140,136 @@ fn setup() -> (QuasarSvm, State) {
 
     let state = State {
         maker,
+        taker,
         mint_a,
         mint_b,
         escrow,
         maker_ata_a,
         maker_ata_b,
+        taker_ata_a,
+        taker_ata_b,
         vault_ata_a,
     };
     (svm, state)
 }
 
-#[test]
-pub fn make_escrow() {
-    let (mut svm, state) = setup();
-
-    let State { maker, mint_a, mint_b, escrow, maker_ata_a, maker_ata_b, vault_ata_a } = state;
-
-    let maker_ata_a_before = svm.get_account(&maker_ata_a).unwrap();
-
+fn run_make(svm: &mut QuasarSvm, state: &State) -> ExecutionResult {
     let make_ix: Instruction = (MakeInstruction {
         deposit: 5_000_000_000,
-        escrow,
-        maker: maker.pubkey(),
-        maker_token_account_for_mint_a: maker_ata_a,
-        maker_token_account_for_mint_b: maker_ata_b,
-        mint_a,
-        mint_b,
+        escrow: state.escrow,
+        maker: state.maker.pubkey(),
+        maker_token_account_for_mint_a: state.maker_ata_a,
+        maker_token_account_for_mint_b: state.maker_ata_b,
+        mint_a: state.mint_a,
+        mint_b: state.mint_b,
         receive: 50,
         system_program: Address::from(quasar_svm::system_program::ID.to_bytes()),
         token_program: Address::from(quasar_svm::SPL_TOKEN_PROGRAM_ID.to_bytes()),
-        vault_token_account_for_mint_a: vault_ata_a,
+        vault_token_account_for_mint_a: state.vault_ata_a,
     }).into();
 
-    let make_result = svm.process_instruction(&make_ix, &[]);
-    make_result.assert_success();
+    let result = svm.process_instruction(&make_ix, &[]);
+    result
+}
 
-    // capture AFTER state
-    let maker_ata_a_after = make_result.account(&maker_ata_a).unwrap();
+fn run_take(svm: &mut QuasarSvm, state: &State) -> ExecutionResult {
+    let take_ix: Instruction = (TakeInstruction {
+        escrow: state.escrow,
+        maker: state.maker.pubkey(),
+        maker_token_account_for_mint_b: state.maker_ata_b,
+        mint_a: state.mint_a,
+        mint_b: state.mint_b,
+        taker: state.taker.pubkey(),
+        taker_token_account_for_mint_b: state.taker_ata_b,
+        taker_token_account_for_mint_a: state.taker_ata_a,
+        system_program: Address::from(quasar_svm::system_program::ID.to_bytes()),
+        token_program: Address::from(quasar_svm::SPL_TOKEN_PROGRAM_ID.to_bytes()),
+        vault_token_account_for_mint_a: state.vault_ata_a,
+    }).into();
+    let result = svm.process_instruction(&take_ix, &[]);
+    result
+}
 
-    let before_data = maker_ata_a_before.data.as_slice();
-    let before_token = SplTokenAccount::unpack(before_data).unwrap();
+fn run_refund(svm: &mut QuasarSvm, state: &State) -> ExecutionResult {
+    let refund_ix: Instruction = (RefundInstruction {
+        escrow: state.escrow,
+        maker: state.maker.pubkey(),
+        maker_token_account_for_mint_a: state.maker_ata_a,
+        mint_a: state.mint_a,
+        system_program: Address::from(quasar_svm::system_program::ID.to_bytes()),
+        token_program: Address::from(quasar_svm::SPL_TOKEN_PROGRAM_ID.to_bytes()),
+        vault_token_account_for_mint_a: state.vault_ata_a,
+    }).into();
 
-    let after_data = maker_ata_a_after.data.as_slice();
-    let after_token = SplTokenAccount::unpack(after_data).unwrap();
+    let result = svm.process_instruction(&refund_ix, &[]);
+    result
+}
 
-    eprintln!("MAKER ATA A BEFORE amount: {}", before_token.amount);
-    eprintln!("MAKER ATA A AFTER amount:  {}", after_token.amount);
+#[test]
+pub fn make_escrow() {
+    let (mut svm, state) = setup();
+    let result = run_make(&mut svm, &state);
+    result.assert_success();
+
+    let vault = SplTokenAccount::unpack(
+        result.account(&state.vault_ata_a).unwrap().data.as_slice()
+    ).unwrap();
+    assert_eq!(vault.amount, 5_000_000_000);
+
+    let maker_ata_a = SplTokenAccount::unpack(
+        result.account(&state.maker_ata_a).unwrap().data.as_slice()
+    ).unwrap();
+    assert_eq!(maker_ata_a.amount, 45_000_000_000);
+}
+
+#[test]
+fn take_escrow() {
+    let (mut svm, state) = setup();
+    run_make(&mut svm, &state).assert_success();
+    let result = run_take(&mut svm, &state);
+    result.assert_success();
+
+    assert!(result.account(&state.vault_ata_a).unwrap().data.is_empty());
+
+    let taker_ata_a = SplTokenAccount::unpack(
+        result.account(&state.taker_ata_a).unwrap().data.as_slice()
+    ).unwrap();
+    assert_eq!(taker_ata_a.amount, 5_000_000_000);
+
+    let maker_ata_b = SplTokenAccount::unpack(
+        result.account(&state.maker_ata_b).unwrap().data.as_slice()
+    ).unwrap();
+    assert_eq!(maker_ata_b.amount, 50);
+
+    let taker_ata_b = SplTokenAccount::unpack(
+        result.account(&state.taker_ata_b).unwrap().data.as_slice()
+    ).unwrap();
+    assert_eq!(taker_ata_b.amount, 49_999_999_950);
+}
+
+#[test]
+fn refund_escrow() {
+    let (mut svm, state) = setup();
+
+    run_make(&mut svm, &state).assert_success();
+    let result = run_refund(&mut svm, &state);
+    result.assert_success();
+
+    let maker_ata_a = SplTokenAccount::unpack(
+        result.account(&state.maker_ata_a).unwrap().data.as_slice()
+    ).unwrap();
+    assert_eq!(maker_ata_a.amount, 50_000_000_000);
+
+    assert!(result.account(&state.vault_ata_a).unwrap().data.is_empty());
+}
+
+#[test]
+fn refund_escrow_should_fail() {
+    let (mut svm, state) = setup();
+
+    run_make(&mut svm, &state).assert_success();
+    run_take(&mut svm, &state).assert_success();
+    run_refund(&mut svm, &state).assert_error(
+        quasar_svm::ProgramError::Runtime(String::from("IllegalOwner"))
+    );
 }
